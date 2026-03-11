@@ -1,222 +1,250 @@
 from flask import Flask, request, jsonify
 import requests
 import re
-from urllib.parse import quote
+import json
 from bs4 import BeautifulSoup
-
+from urllib.parse import quote
 
 app = Flask(__name__)
 
+BASE_LISTADO = "https://listado.mercadolibre.com.mx/"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 
-
-def normalizar_texto(texto: str) -> str:
-    texto = (texto or "").upper().strip()
-    texto = re.sub(r"\s+", " ", texto)
-    return texto
+def normalizar(texto: str) -> str:
+    return re.sub(r"\s+", " ", str(texto or "")).strip()
 
 
-def limpiar_busqueda(texto: str) -> str:
-    texto = str(texto or "").strip()
-    texto = re.sub(r"\s+", " ", texto)
-    texto = re.sub(r"[^\w\s\/\-\.\+]", " ", texto)
-    texto = re.sub(r"\s+", " ", texto).strip()
-    return texto
+def extraer_texto(node):
+    return normalizar(node.get_text(" ", strip=True)) if node else ""
 
 
-def detectar_paquete(texto: str) -> int:
-    t = normalizar_texto(texto)
-
-    if re.search(r"\bKIT DE 4\b|\bPAQUETE DE 4\b|\b4 LLANTAS\b|\b4 NEUMATICOS\b", t):
-        return 4
-    if re.search(r"\bKIT DE 2\b|\bPAQUETE DE 2\b|\b2 LLANTAS\b|\b2 NEUMATICOS\b", t):
-        return 2
-    return 1
-
-
-def analizar_descripcion_llanta(texto: str) -> dict:
-    t = normalizar_texto(texto)
-
-    marcas = [
-        "CONTINENTAL", "GOODYEAR", "HANKOOK", "GITI", "ATLAS", "MICHELIN",
-        "PIRELLI", "BRIDGESTONE", "FIRESTONE", "YOKOHAMA", "DUNLOP",
-        "GENERAL TIRE", "BFGOODRICH", "TOYO", "KUMHO", "MAXXIS"
+def extraer_precio_desde_html(item):
+    """
+    Intenta varios selectores comunes en Mercado Libre.
+    """
+    selectores = [
+        ".andes-money-amount__fraction",
+        ".price-tag-fraction",
+        "span.andes-money-amount__fraction",
+        "span.price-tag-fraction",
     ]
 
-    marca = ""
-    for m in marcas:
-        if m in t:
-            marca = m
-            break
+    for sel in selectores:
+        n = item.select_one(sel)
+        if n:
+            txt = extraer_texto(n)
+            txt = re.sub(r"[^\d]", "", txt)
+            if txt:
+                return f"${int(txt):,}".replace(",", ",")
 
-    medida_match = re.search(r"\b\d{3}\/\d{2}R\d{2}\b|\b\d{3}\/\d{2}ZR\d{2}\b|\b\d{3}\/\d{2}SR\d{2}\b|\b\d{3}\/\d{2}\/R\d{2}\b", t)
-    medida = medida_match.group(0).replace("/R", "R") if medida_match else ""
-
-    limpio = t
-    for token in ["LLANTA", "NEUMATICO", "NEUMATICOS", "KIT", "PAQUETE", "AUTO", "CAMIONETA"]:
-        limpio = re.sub(rf"\b{token}\b", " ", limpio)
-
-    tokens = [x for x in limpio.split() if len(x) > 2]
-
-    modelo_tokens = list(tokens)
-    if marca:
-        modelo_tokens = [x for x in modelo_tokens if x != marca]
-    if medida:
-        modelo_tokens = [x for x in modelo_tokens if x != medida]
-
-    return {
-        "marca": marca,
-        "medida": medida,
-        "modelo": " ".join(modelo_tokens).strip(),
-        "tokens": modelo_tokens
-    }
+    return ""
 
 
-def contar_tokens_coincidentes(a: list, b: list) -> int:
-    if not a or not b:
-        return 0
-    set_b = set(b)
-    return sum(1 for x in a if x in set_b)
+def extraer_link(item):
+    selectores = [
+        "a.poly-component__title",
+        "a.ui-search-link",
+        "a[href*='/MLM-']",
+        "a[href]"
+    ]
+
+    for sel in selectores:
+        a = item.select_one(sel)
+        if a and a.get("href"):
+            return a["href"]
+
+    return ""
 
 
-def similitud_texto(a: str, b: str) -> float:
-    ta = (a or "").strip()
-    tb = (b or "").strip()
-    if not ta or not tb:
-        return 0.0
+def extraer_titulo(item):
+    selectores = [
+        "a.poly-component__title",
+        "h2",
+        ".ui-search-item__title",
+    ]
+    for sel in selectores:
+        n = item.select_one(sel)
+        txt = extraer_texto(n)
+        if txt:
+            return txt
+    return ""
 
-    tokens_a = ta.split()
-    tokens_b = tb.split()
-    comunes = contar_tokens_coincidentes(tokens_a, tokens_b)
-    base = max(len(tokens_a), len(tokens_b), 1)
-    return comunes / base
+
+def extraer_vendedor_desde_listado(item):
+    patrones = [
+        ".poly-component__seller",
+        ".ui-search-item__group__element--seller",
+        "[class*='seller']",
+    ]
+    for sel in patrones:
+        n = item.select_one(sel)
+        txt = extraer_texto(n)
+        if txt:
+            return txt
+    return ""
 
 
-def formatear_moneda(num) -> str:
+def extraer_vendedor_desde_detalle(url):
+    if not url:
+        return ""
+
     try:
-        n = float(num)
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return ""
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        texto = soup.get_text(" ", strip=True)
+
+        # Intentos por HTML visible
+        candidatos = [
+            soup.select_one("[data-testid='seller-link']"),
+            soup.select_one("[data-testid='seller-name']"),
+            soup.select_one("a[href*='perfil']"),
+            soup.select_one("a[href*='seller']"),
+        ]
+
+        for c in candidatos:
+            txt = extraer_texto(c)
+            if txt:
+                return txt
+
+        # Intento por JSON embebido
+        m = re.search(r'"nickname"\s*:\s*"([^"]+)"', r.text)
+        if m:
+            return m.group(1)
+
+        # Intento por texto visible
+        m2 = re.search(r"Vendido por\s+([A-Za-z0-9 _\-\.]+)", texto, re.IGNORECASE)
+        if m2:
+            return normalizar(m2.group(1))
+
+        return ""
+
     except Exception:
         return ""
-    return "${:,.2f}".format(n)
 
 
-def elegir_mejor_resultado(descripcion: str, results: list) -> dict | None:
-    objetivo = analizar_descripcion_llanta(descripcion)
+def extraer_precio_desde_scripts(html):
+    """
+    Fallback: busca precio dentro de scripts embebidos.
+    """
+    patrones = [
+        r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+        r'"amount"\s*:\s*([0-9]+(?:\.[0-9]+)?)'
+    ]
 
-    mejor = None
-    mejor_score = -999999
+    for patron in patrones:
+        m = re.search(patron, html)
+        if m:
+            try:
+                valor = float(m.group(1))
+                return f"${valor:,.0f}".replace(",", ",")
+            except Exception:
+                pass
 
-    for item in results:
-        titulo = item.get("title", "")
-        analisis_titulo = analizar_descripcion_llanta(titulo)
-
-        score = 0
-
-        if objetivo["marca"] and analisis_titulo["marca"] and objetivo["marca"] == analisis_titulo["marca"]:
-            score += 40
-
-        if objetivo["medida"] and analisis_titulo["medida"] and objetivo["medida"] == analisis_titulo["medida"]:
-            score += 80
-
-        if objetivo["modelo"] and analisis_titulo["modelo"]:
-            score += round(similitud_texto(objetivo["modelo"], analisis_titulo["modelo"]) * 50)
-
-        score += contar_tokens_coincidentes(objetivo["tokens"], analisis_titulo["tokens"]) * 5
-
-        paquete = detectar_paquete(titulo)
-        if paquete == 4:
-            score += 20
-        elif paquete == 2:
-            score += 15
-
-        if objetivo["medida"] and analisis_titulo["medida"] and objetivo["medida"] != analisis_titulo["medida"]:
-            score -= 120
-
-        if objetivo["marca"] and analisis_titulo["marca"] and objetivo["marca"] != analisis_titulo["marca"]:
-            score -= 60
-
-        price = float(item.get("price") or 0)
-        if price > 0:
-            score += 100000 / (price / paquete)
-
-        if score > mejor_score:
-            mejor_score = score
-            mejor = item
-
-    return mejor
+    return ""
 
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "ml-search-api"})
+    return jsonify({"ok": True, "service": "ml-html-parser"})
 
 
 @app.get("/buscar")
 def buscar():
-
-    q = request.args.get("q", "").strip()
+    q = normalizar(request.args.get("q", ""))
 
     if not q:
-        return {
+        return jsonify({
             "estado": "QUERY VACIA",
             "precio": "",
             "proveedor": "",
-            "url": ""
-        }
+            "url": "",
+            "titulo_encontrado": ""
+        }), 400
 
-    query = quote(q)
-
-    url = f"https://listado.mercadolibre.com.mx/{query}"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "es-MX,es;q=0.9"
-    }
+    url_busqueda = f"{BASE_LISTADO}{quote(q)}"
 
     try:
-
-        r = requests.get(url, headers=headers, timeout=20)
+        r = requests.get(url_busqueda, headers=HEADERS, timeout=25)
 
         if r.status_code != 200:
-            return {
+            return jsonify({
                 "estado": f"HTTP {r.status_code}",
                 "precio": "",
                 "proveedor": "",
-                "url": url
-            }
+                "url": url_busqueda,
+                "titulo_encontrado": ""
+            })
 
-        soup = BeautifulSoup(r.text, "html.parser")
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
 
-        item = soup.select_one(".ui-search-result__wrapper")
+        # Intenta varios contenedores posibles
+        contenedores = (
+            soup.select("li.ui-search-layout__item") or
+            soup.select(".ui-search-result__wrapper") or
+            soup.select("ol li")
+        )
 
-        if not item:
-            return {
-                "estado": "NO RESULT",
+        if not contenedores:
+            return jsonify({
+                "estado": "NO RESULTADOS HTML",
                 "precio": "",
                 "proveedor": "",
-                "url": url
-            }
+                "url": url_busqueda,
+                "titulo_encontrado": ""
+            })
 
-        precio = item.select_one(".price-tag-fraction")
-        vendedor = item.select_one(".ui-search-item__group__element--seller")
-        link = item.select_one("a.ui-search-link")
+        item = contenedores[0]
 
-        precio_text = precio.text if precio else ""
-        vendedor_text = vendedor.text if vendedor else ""
-        link_url = link["href"] if link else url
+        titulo = extraer_titulo(item)
+        link = extraer_link(item)
+        precio = extraer_precio_desde_html(item)
+        proveedor = extraer_vendedor_desde_listado(item)
 
-        return {
-            "estado": "OK",
-            "precio": f"${precio_text}",
-            "proveedor": vendedor_text,
-            "url": link_url
-        }
+        if not precio:
+            precio = extraer_precio_desde_scripts(str(item)) or extraer_precio_desde_scripts(html)
+
+        if not proveedor:
+            proveedor = extraer_vendedor_desde_detalle(link)
+
+        # Si el link es relativo o viene vacío
+        if not link:
+            link = url_busqueda
+
+        estado = "OK"
+        if not precio:
+            estado = "SIN PRECIO"
+        elif not proveedor:
+            estado = "OK SIN PROVEEDOR"
+
+        return jsonify({
+            "estado": estado,
+            "precio": precio,
+            "proveedor": proveedor,
+            "url": link,
+            "titulo_encontrado": titulo
+        })
 
     except Exception as e:
-
-        return {
-            "estado": "ERROR",
+        return jsonify({
+            "estado": f"ERROR: {str(e)[:120]}",
             "precio": "",
-            "proveedor": str(e),
-            "url": url
-        }
+            "proveedor": "",
+            "url": url_busqueda,
+            "titulo_encontrado": ""
+        })
