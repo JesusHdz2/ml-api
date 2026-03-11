@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import requests
 import re
-import json
 from bs4 import BeautifulSoup
 from urllib.parse import quote
 
@@ -23,17 +22,81 @@ HEADERS = {
 
 
 def normalizar(texto: str) -> str:
-    return re.sub(r"\s+", " ", str(texto or "")).strip()
+    texto = str(texto or "").upper().strip()
+    texto = texto.replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ó", "O").replace("Ú", "U")
+    texto = re.sub(r"\s+", " ", texto)
+    return texto
 
 
 def extraer_texto(node):
     return normalizar(node.get_text(" ", strip=True)) if node else ""
 
 
-def extraer_precio_desde_html(item):
-    """
-    Intenta varios selectores comunes en Mercado Libre.
-    """
+def detectar_paquete(texto: str) -> int:
+    t = normalizar(texto)
+    if re.search(r"\bKIT DE 4\b|\bPAQUETE DE 4\b|\b4 LLANTAS\b|\b4 NEUMATICOS\b", t):
+        return 4
+    if re.search(r"\bKIT DE 2\b|\bPAQUETE DE 2\b|\b2 LLANTAS\b|\b2 NEUMATICOS\b", t):
+        return 2
+    return 1
+
+
+def analizar_llanta(texto: str) -> dict:
+    t = normalizar(texto)
+
+    marcas = [
+        "CONTINENTAL", "GOODYEAR", "HANKOOK", "GITI", "ATLAS", "MICHELIN",
+        "PIRELLI", "BRIDGESTONE", "FIRESTONE", "YOKOHAMA", "DUNLOP",
+        "GENERAL TIRE", "BFGOODRICH", "TOYO", "KUMHO", "MAXXIS"
+    ]
+
+    marca = ""
+    for m in marcas:
+        if m in t:
+            marca = m
+            break
+
+    medida_match = re.search(r"\b\d{3}\/\d{2}R\d{2}\b|\b\d{3}\/\d{2}ZR\d{2}\b|\b\d{3}\/\d{2}SR\d{2}\b", t)
+    medida = medida_match.group(0) if medida_match else ""
+
+    limpio = t
+    for token in ["LLANTA", "LLANTA", "NEUMATICO", "NEUMATICOS", "KIT", "PAQUETE"]:
+        limpio = re.sub(rf"\b{token}\b", " ", limpio)
+
+    tokens = [x for x in limpio.split() if len(x) > 2]
+
+    modelo_tokens = tokens[:]
+    if marca:
+        modelo_tokens = [x for x in modelo_tokens if x != marca]
+    if medida:
+        modelo_tokens = [x for x in modelo_tokens if x != medida]
+
+    return {
+        "marca": marca,
+        "medida": medida,
+        "tokens": modelo_tokens,
+        "modelo": " ".join(modelo_tokens).strip()
+    }
+
+
+def contar_coincidencias(a: list, b: list) -> int:
+    if not a or not b:
+        return 0
+    set_b = set(b)
+    return sum(1 for x in a if x in set_b)
+
+
+def similitud_modelo(a: str, b: str) -> float:
+    ta = [x for x in normalizar(a).split() if x]
+    tb = [x for x in normalizar(b).split() if x]
+    if not ta or not tb:
+        return 0.0
+    comunes = contar_coincidencias(ta, tb)
+    base = max(len(ta), len(tb), 1)
+    return comunes / base
+
+
+def extraer_precio(item):
     selectores = [
         ".andes-money-amount__fraction",
         ".price-tag-fraction",
@@ -47,9 +110,16 @@ def extraer_precio_desde_html(item):
             txt = extraer_texto(n)
             txt = re.sub(r"[^\d]", "", txt)
             if txt:
-                return f"${int(txt):,}".replace(",", ",")
+                valor = int(txt)
+                return valor, f"${valor:,.0f}"
 
-    return ""
+    html = str(item)
+    m = re.search(r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)', html)
+    if m:
+        valor = int(float(m.group(1)))
+        return valor, f"${valor:,.0f}"
+
+    return 0, ""
 
 
 def extraer_link(item):
@@ -82,7 +152,7 @@ def extraer_titulo(item):
     return ""
 
 
-def extraer_vendedor_desde_listado(item):
+def extraer_vendedor_listado(item):
     patrones = [
         ".poly-component__seller",
         ".ui-search-item__group__element--seller",
@@ -96,7 +166,7 @@ def extraer_vendedor_desde_listado(item):
     return ""
 
 
-def extraer_vendedor_desde_detalle(url):
+def extraer_vendedor_detalle(url):
     if not url:
         return ""
 
@@ -108,7 +178,6 @@ def extraer_vendedor_desde_detalle(url):
         soup = BeautifulSoup(r.text, "html.parser")
         texto = soup.get_text(" ", strip=True)
 
-        # Intentos por HTML visible
         candidatos = [
             soup.select_one("[data-testid='seller-link']"),
             soup.select_one("[data-testid='seller-name']"),
@@ -121,41 +190,55 @@ def extraer_vendedor_desde_detalle(url):
             if txt:
                 return txt
 
-        # Intento por JSON embebido
         m = re.search(r'"nickname"\s*:\s*"([^"]+)"', r.text)
         if m:
-            return m.group(1)
+            return normalizar(m.group(1))
 
-        # Intento por texto visible
-        m2 = re.search(r"Vendido por\s+([A-Za-z0-9 _\-\.]+)", texto, re.IGNORECASE)
+        m2 = re.search(r"VENDIDO POR\s+([A-Z0-9 _\-.]+)", normalizar(texto))
         if m2:
             return normalizar(m2.group(1))
 
         return ""
-
     except Exception:
         return ""
 
 
-def extraer_precio_desde_scripts(html):
-    """
-    Fallback: busca precio dentro de scripts embebidos.
-    """
-    patrones = [
-        r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-        r'"amount"\s*:\s*([0-9]+(?:\.[0-9]+)?)'
-    ]
+def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_num: int) -> tuple:
+    encontrado = analizar_llanta(titulo_encontrado)
 
-    for patron in patrones:
-        m = re.search(patron, html)
-        if m:
-            try:
-                valor = float(m.group(1))
-                return f"${valor:,.0f}".replace(",", ",")
-            except Exception:
-                pass
+    score = 0
+    razones = []
 
-    return ""
+    if descripcion_objetivo["marca"] and encontrado["marca"]:
+        if descripcion_objetivo["marca"] == encontrado["marca"]:
+            score += 80
+            razones.append("marca")
+        else:
+            score -= 120
+
+    if descripcion_objetivo["medida"] and encontrado["medida"]:
+        if descripcion_objetivo["medida"] == encontrado["medida"]:
+            score += 120
+            razones.append("medida")
+        else:
+            score -= 150
+
+    sim_modelo = similitud_modelo(descripcion_objetivo["modelo"], encontrado["modelo"])
+    score += int(sim_modelo * 100)
+
+    coincidencias = contar_coincidencias(descripcion_objetivo["tokens"], encontrado["tokens"])
+    score += coincidencias * 8
+
+    paquete = detectar_paquete(titulo_encontrado)
+    if paquete == 4:
+        score += 15
+    elif paquete == 2:
+        score += 10
+
+    if precio_num > 0:
+        score += int(50000 / max(precio_num / paquete, 1))
+
+    return score, paquete, razones
 
 
 @app.get("/")
@@ -190,17 +273,15 @@ def buscar():
                 "titulo_encontrado": ""
             })
 
-        html = r.text
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        # Intenta varios contenedores posibles
-        contenedores = (
+        items = (
             soup.select("li.ui-search-layout__item") or
             soup.select(".ui-search-result__wrapper") or
             soup.select("ol li")
         )
 
-        if not contenedores:
+        if not items:
             return jsonify({
                 "estado": "NO RESULTADOS HTML",
                 "precio": "",
@@ -209,35 +290,64 @@ def buscar():
                 "titulo_encontrado": ""
             })
 
-        item = contenedores[0]
+        objetivo = analizar_llanta(q)
 
-        titulo = extraer_titulo(item)
-        link = extraer_link(item)
-        precio = extraer_precio_desde_html(item)
-        proveedor = extraer_vendedor_desde_listado(item)
+        mejor = None
+        mejor_score = -999999
 
-        if not precio:
-            precio = extraer_precio_desde_scripts(str(item)) or extraer_precio_desde_scripts(html)
+        for item in items[:10]:
+            titulo = extraer_titulo(item)
+            if not titulo:
+                continue
 
-        if not proveedor:
-            proveedor = extraer_vendedor_desde_detalle(link)
+            precio_num, precio_txt = extraer_precio(item)
+            link = extraer_link(item)
+            proveedor = extraer_vendedor_listado(item)
 
-        # Si el link es relativo o viene vacío
-        if not link:
-            link = url_busqueda
+            score, paquete, razones = calcular_score(objetivo, titulo, precio_num)
+
+            candidato = {
+                "score": score,
+                "titulo": titulo,
+                "precio_num": precio_num,
+                "precio_txt": precio_txt,
+                "link": link,
+                "proveedor": proveedor,
+                "paquete": paquete,
+                "razones": razones
+            }
+
+            if candidato["score"] > mejor_score:
+                mejor_score = candidato["score"]
+                mejor = candidato
+
+        if not mejor:
+            return jsonify({
+                "estado": "SIN MATCH",
+                "precio": "",
+                "proveedor": "",
+                "url": url_busqueda,
+                "titulo_encontrado": ""
+            })
+
+        proveedor_final = mejor["proveedor"]
+        if not proveedor_final:
+            proveedor_final = extraer_vendedor_detalle(mejor["link"])
 
         estado = "OK"
-        if not precio:
+        if not mejor["precio_txt"]:
             estado = "SIN PRECIO"
-        elif not proveedor:
+        elif not proveedor_final:
             estado = "OK SIN PROVEEDOR"
 
         return jsonify({
             "estado": estado,
-            "precio": precio,
-            "proveedor": proveedor,
-            "url": link,
-            "titulo_encontrado": titulo
+            "precio": mejor["precio_txt"],
+            "proveedor": proveedor_final,
+            "url": mejor["link"] or url_busqueda,
+            "titulo_encontrado": mejor["titulo"],
+            "score": mejor["score"],
+            "paquete": mejor["paquete"]
         })
 
     except Exception as e:
