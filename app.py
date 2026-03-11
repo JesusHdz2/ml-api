@@ -63,14 +63,26 @@ def analizar_llanta(texto: str) -> dict:
             marca = m
             break
 
-    medida_match = re.search(
-        r"\b\d{3}\/\d{2}R\d{2}\b|\b\d{3}\/\d{2}ZR\d{2}\b|\b\d{3}\/\d{2}SR\d{2}\b",
-        t
-    )
-    medida = medida_match.group(0) if medida_match else ""
+    medida_patterns = [
+        r"\b\d{3}\/\d{2}R\d{2}\b",
+        r"\b\d{3}\/\d{2}ZR\d{2}\b",
+        r"\b\d{3}\/\d{2}SR\d{2}\b",
+        r"\b\d{3}\/\d{2}-\d{2}\b",
+        r"\b\d{2,3}X\d{2}\.?\d{1,2}-\d{2}\b"
+    ]
+
+    medida = ""
+    for pat in medida_patterns:
+        m = re.search(pat, t)
+        if m:
+            medida = m.group(0)
+            break
 
     limpio = t
-    for token in ["LLANTA", "LLANTAS", "NEUMATICO", "NEUMATICOS", "KIT", "PAQUETE", "P"]:
+    for token in [
+        "LLANTA", "LLANTAS", "NEUMATICO", "NEUMATICOS", "KIT", "PAQUETE", "P",
+        "AUTO", "AUTOMOVIL", "CARRO", "CARRo", "SUV", "CAMIONETA"
+    ]:
         limpio = re.sub(rf"\b{token}\b", " ", limpio)
 
     tokens = [x for x in limpio.split() if len(x) > 1]
@@ -81,7 +93,6 @@ def analizar_llanta(texto: str) -> dict:
     if medida:
         modelo_tokens = [x for x in modelo_tokens if x != medida]
 
-    # quitar índices/códigos genéricos que meten ruido
     modelo_tokens = [
         x for x in modelo_tokens
         if not re.fullmatch(r"\d{2,3}", x)
@@ -123,17 +134,34 @@ def penalizacion_modelo_conflictivo(objetivo_modelo: str, encontrado_modelo: str
         "PREMIUMCONTACT", "POWERCONTACT", "ULTRACONTACT",
         "ECOCONTACT", "PROCONTACT", "CONTIPROCONTACT",
         "CONTIECOCONTACT", "CROSSCONTACT", "SPORTCONTACT",
-        "EAGLE SPORT", "KINERGY", "VENTUS", "OPTIMO"
+        "EAGLE SPORT", "KINERGY", "VENTUS", "OPTIMO",
+        "CONTISCOOT", "SCORPION", "WRANGLER"
     ]
 
     objetivo_hits = [f for f in familias_conflictivas if f in objetivo]
     encontrado_hits = [f for f in familias_conflictivas if f in encontrado]
 
-    if objetivo_hits and encontrado_hits:
-        if objetivo_hits[0] != encontrado_hits[0]:
-            return -180
+    if objetivo_hits and encontrado_hits and objetivo_hits[0] != encontrado_hits[0]:
+        return -250
 
     return 0
+
+
+def penalizacion_palabras_conflictivas(titulo: str) -> int:
+    t = normalizar(titulo)
+
+    conflictivas = [
+        "SCOOTER", "MOTO", "MOTOCICLETA", "CUATRIMOTO", "ATV",
+        "BICICLETA", "TRAILER", "REMOLQUE", "CAMARA", "RIN",
+        "ARO", "REFACCION", "VALVULA"
+    ]
+
+    penalty = 0
+    for palabra in conflictivas:
+        if palabra in t:
+            penalty -= 220
+
+    return penalty
 
 
 def extraer_precio(item):
@@ -154,7 +182,6 @@ def extraer_precio(item):
                 return valor, f"${valor:,.0f}"
 
     html = str(item)
-
     patrones = [
         r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
         r'"amount"\s*:\s*([0-9]+(?:\.[0-9]+)?)'
@@ -255,50 +282,56 @@ def extraer_vendedor_detalle(url):
         return ""
 
 
+def medida_compatible(medida_obj: str, medida_enc: str) -> bool:
+    if not medida_obj or not medida_enc:
+        return False
+    return normalizar(medida_obj) == normalizar(medida_enc)
+
+
 def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_num: int) -> tuple:
     encontrado = analizar_llanta(titulo_encontrado)
 
     score = 0
     razones = []
 
-    # marca
     if descripcion_objetivo["marca"] and encontrado["marca"]:
         if descripcion_objetivo["marca"] == encontrado["marca"]:
             score += 80
             razones.append("marca")
         else:
-            score -= 150
+            score -= 250
 
-    # medida
-    if descripcion_objetivo["medida"] and encontrado["medida"]:
-        if descripcion_objetivo["medida"] == encontrado["medida"]:
-            score += 140
-            razones.append("medida")
+    # medida casi obligatoria
+    if descripcion_objetivo["medida"]:
+        if encontrado["medida"]:
+            if medida_compatible(descripcion_objetivo["medida"], encontrado["medida"]):
+                score += 220
+                razones.append("medida")
+            else:
+                score -= 500
         else:
             score -= 200
 
-    # similitud modelo
     sim_modelo = similitud_modelo(descripcion_objetivo["modelo"], encontrado["modelo"])
-    score += int(sim_modelo * 120)
+    score += int(sim_modelo * 140)
 
-    # tokens
     coincidencias = contar_coincidencias(descripcion_objetivo["tokens"], encontrado["tokens"])
-    score += coincidencias * 10
+    score += coincidencias * 12
 
-    # penalización por familia conflictiva
     score += penalizacion_modelo_conflictivo(
         descripcion_objetivo["modelo"],
         encontrado["modelo"]
     )
 
-    # versión numérica del modelo
+    score += penalizacion_palabras_conflictivas(titulo_encontrado)
+
     nums_obj = re.findall(r"\b\d+\b", descripcion_objetivo["modelo"])
     nums_enc = re.findall(r"\b\d+\b", encontrado["modelo"])
     if nums_obj:
         if any(n in nums_enc for n in nums_obj):
-            score += 30
+            score += 40
         else:
-            score -= 50
+            score -= 80
 
     paquete = detectar_paquete(titulo_encontrado)
     if paquete == 4:
@@ -306,11 +339,10 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
     elif paquete == 2:
         score += 10
 
-    # precio por unidad
     if precio_num > 0:
-        score += int(50000 / max(precio_num / paquete, 1))
+        score += int(40000 / max(precio_num / paquete, 1))
 
-    return score, paquete, razones
+    return score, paquete, razones, encontrado
 
 
 @app.get("/")
@@ -367,7 +399,7 @@ def buscar():
         mejor = None
         mejor_score = -999999
 
-        for item in items[:10]:
+        for item in items[:12]:
             titulo = extraer_titulo(item)
             if not titulo:
                 continue
@@ -376,7 +408,15 @@ def buscar():
             link = extraer_link(item)
             proveedor = extraer_vendedor_listado(item)
 
-            score, paquete, razones = calcular_score(objetivo, titulo, precio_num)
+            score, paquete, razones, encontrado = calcular_score(objetivo, titulo, precio_num)
+
+            # filtro mínimo: si la marca o medida chocan muy feo, no considerar
+            if objetivo["marca"] and encontrado["marca"] and objetivo["marca"] != encontrado["marca"]:
+                continue
+
+            if objetivo["medida"] and encontrado["medida"]:
+                if not medida_compatible(objetivo["medida"], encontrado["medida"]):
+                    continue
 
             candidato = {
                 "score": score,
