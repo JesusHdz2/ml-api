@@ -2,10 +2,12 @@ from flask import Flask, request, jsonify
 import requests
 import re
 from urllib.parse import quote
+from bs4 import BeautifulSoup
+
 
 app = Flask(__name__)
 
-ML_SEARCH_URL = "https://api.mercadolibre.com/sites/MLM/search"
+
 
 
 def normalizar_texto(texto: str) -> str:
@@ -151,78 +153,70 @@ def health():
 
 @app.get("/buscar")
 def buscar():
+
     q = request.args.get("q", "").strip()
 
     if not q:
-        return jsonify({
+        return {
+            "estado": "QUERY VACIA",
             "precio": "",
             "proveedor": "",
-            "url": "",
-            "estado": "QUERY VACIA"
-        }), 400
+            "url": ""
+        }
 
-    query = limpiar_busqueda(q)
+    query = quote(q)
 
-    params = {
-        "q": query,
-        "limit": 10
-    }
+    url = f"https://listado.mercadolibre.com.mx/{query}"
 
     headers = {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "es-MX,es;q=0.9"
     }
 
     try:
-        response = requests.get(ML_SEARCH_URL, params=params, headers=headers, timeout=20)
 
-        if response.status_code != 200:
-            return jsonify({
+        r = requests.get(url, headers=headers, timeout=20)
+
+        if r.status_code != 200:
+            return {
+                "estado": f"HTTP {r.status_code}",
                 "precio": "",
                 "proveedor": "",
-                "url": f"https://listado.mercadolibre.com.mx/{quote(query)}",
-                "estado": f"HTTP {response.status_code}"
-            }), 200
+                "url": url
+            }
 
-        data = response.json()
-        results = data.get("results", [])
+        soup = BeautifulSoup(r.text, "html.parser")
 
-        if not results:
-            return jsonify({
+        item = soup.select_one(".ui-search-result__wrapper")
+
+        if not item:
+            return {
+                "estado": "NO RESULT",
                 "precio": "",
                 "proveedor": "",
-                "url": f"https://listado.mercadolibre.com.mx/{quote(query)}",
-                "estado": "NO RESULTS"
-            })
+                "url": url
+            }
 
-        mejor = elegir_mejor_resultado(q, results)
+        precio = item.select_one(".price-tag-fraction")
+        vendedor = item.select_one(".ui-search-item__group__element--seller")
+        link = item.select_one("a.ui-search-link")
 
-        if not mejor:
-            return jsonify({
-                "precio": "",
-                "proveedor": "",
-                "url": f"https://listado.mercadolibre.com.mx/{quote(query)}",
-                "estado": "SIN MATCH"
-            })
+        precio_text = precio.text if precio else ""
+        vendedor_text = vendedor.text if vendedor else ""
+        link_url = link["href"] if link else url
 
-        return jsonify({
-            "precio": formatear_moneda(mejor.get("price")),
-            "proveedor": (mejor.get("seller") or {}).get("nickname", ""),
-            "url": mejor.get("permalink", ""),
+        return {
             "estado": "OK",
-            "titulo": mejor.get("title", ""),
-            "paquete": detectar_paquete(mejor.get("title", "")),
-            "precio_numerico": mejor.get("price", 0)
-        })
+            "precio": f"${precio_text}",
+            "proveedor": vendedor_text,
+            "url": link_url
+        }
 
     except Exception as e:
-        return jsonify({
+
+        return {
+            "estado": "ERROR",
             "precio": "",
-            "proveedor": "",
-            "url": f"https://listado.mercadolibre.com.mx/{quote(query)}",
-            "estado": f"ERROR: {str(e)[:120]}"
-        }), 200
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+            "proveedor": str(e),
+            "url": url
+        }
