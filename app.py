@@ -1,12 +1,14 @@
 from flask import Flask, request, jsonify
 import requests
 import re
+import os
 from urllib.parse import quote
 
 app = Flask(__name__)
 
 MI_VENDEDOR = "COMERCIALIZADORADEPROMOCIONES"
 ML_API_SEARCH = "https://api.mercadolibre.com/sites/MLM/search"
+ML_ACCESS_TOKEN = os.getenv("ML_ACCESS_TOKEN", "")
 
 
 def normalizar(texto: str) -> str:
@@ -68,11 +70,14 @@ def analizar_llanta(texto: str) -> dict:
             medida = m.group(0)
             break
 
-    indice_pat = re.search(r"\b\d{2,3}\/?\d{0,3}[A-Z]{1,2}\b|\b\d{2,3}[A-Z]\b", t)
-    indice = indice_pat.group(0) if indice_pat else ""
+    indice = ""
+    partes = t.split()
+    if partes:
+        ultimo = partes[-1]
+        if re.fullmatch(r"\d{2,3}[A-Z]{1,2}", ultimo) or re.fullmatch(r"\d{2,3}/\d{2,3}[A-Z]{1,2}", ultimo):
+            indice = ultimo
 
     limpio = t
-
     basura = [
         "LLANTA", "LLANTAS", "NEUMATICO", "NEUMATICOS",
         "AUTO", "AUTOMOVIL", "CARRO", "SUV", "CAMIONETA"
@@ -112,7 +117,6 @@ def analizar_llanta(texto: str) -> dict:
 def contar_coincidencias(lista_a: list, lista_b: list) -> int:
     if not lista_a or not lista_b:
         return 0
-
     set_b = set(lista_b)
     return sum(1 for x in lista_a if x in set_b)
 
@@ -126,7 +130,6 @@ def similitud_modelo(a: str, b: str) -> float:
 
     comunes = contar_coincidencias(ta, tb)
     base = max(len(ta), len(tb), 1)
-
     return comunes / base
 
 
@@ -175,7 +178,6 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
     score = 0
     razones = []
 
-    # Marca
     if descripcion_objetivo["marca"] and encontrado["marca"]:
         if descripcion_objetivo["marca"] == encontrado["marca"]:
             score += 80
@@ -183,7 +185,6 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
         else:
             score -= 300
 
-    # Medida
     if descripcion_objetivo["medida"]:
         if encontrado["medida"]:
             if medida_compatible(descripcion_objetivo["medida"], encontrado["medida"]):
@@ -194,7 +195,6 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
         else:
             score -= 180
 
-    # Índice
     if descripcion_objetivo["indice"] and encontrado["indice"]:
         if descripcion_objetivo["indice"] == encontrado["indice"]:
             score += 40
@@ -202,7 +202,6 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
         else:
             score -= 70
 
-    # Similitud de modelo
     sim_modelo = similitud_modelo(descripcion_objetivo["modelo"], encontrado["modelo"])
     score += int(sim_modelo * 160)
 
@@ -214,7 +213,6 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
         encontrado["modelo"]
     )
 
-    # Penaliza palabras conflictivas
     conflictivas = [
         "MOTO", "MOTOCICLETA", "SCOOTER", "ATV", "CUATRIMOTO",
         "RIN", "ARO", "VALVULA", "CAMARA", "REFACCION"
@@ -224,7 +222,6 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
         if palabra in titulo_norm:
             score -= 220
 
-    # Penaliza kits
     paquete = detectar_paquete(titulo_encontrado)
     if paquete == 4:
         score -= 500
@@ -233,7 +230,6 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
     else:
         score += 60
 
-    # Pequeño premio al menor precio
     if precio_num > 0:
         score += int(25000 / max(precio_num, 1))
 
@@ -267,11 +263,15 @@ def buscar():
     url_api = f"{ML_API_SEARCH}?q={quote(q, safe='')}"
 
     try:
-        r = requests.get(
-            url_api,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=25
-        )
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json"
+        }
+
+        if ML_ACCESS_TOKEN:
+            headers["Authorization"] = f"Bearer {ML_ACCESS_TOKEN}"
+
+        r = requests.get(url_api, headers=headers, timeout=25)
 
         if r.status_code != 200:
             return jsonify({
@@ -304,7 +304,6 @@ def buscar():
 
         mejor_comp = None
         mejor_comp_score = -999999
-
         mejor_propio = None
         mejor_propio_score = -999999
 
@@ -316,7 +315,8 @@ def buscar():
             precio_num = int(item.get("price", 0) or 0)
             precio_txt = f"${precio_num:,.0f}" if precio_num else ""
             link = item.get("permalink", "")
-            proveedor = normalizar(item.get("seller", {}).get("nickname", ""))
+            seller = item.get("seller") or {}
+            proveedor = normalizar(seller.get("nickname", ""))
             estado_item = normalizar(item.get("status", ""))
             stock = int(item.get("available_quantity", 0) or 0)
 
@@ -361,19 +361,14 @@ def buscar():
         estado = "SIN_RESULTADOS"
 
         if mejor_comp and mejor_propio:
-            if mejor_propio["precio_num"] and mejor_comp["precio_num"]:
-                if mejor_propio["precio_num"] < mejor_comp["precio_num"]:
-                    estado = "MAS_BARATO"
-                elif mejor_propio["precio_num"] > mejor_comp["precio_num"]:
-                    estado = "MAS_CARO"
-                else:
-                    estado = "IGUALADO"
+            if mejor_propio["precio_num"] < mejor_comp["precio_num"]:
+                estado = "MAS_BARATO"
+            elif mejor_propio["precio_num"] > mejor_comp["precio_num"]:
+                estado = "MAS_CARO"
             else:
-                estado = "OK"
-
+                estado = "IGUALADO"
         elif mejor_comp and not mejor_propio:
             estado = "SIN_PUBLICACION_PROPIA"
-
         elif mejor_propio and not mejor_comp:
             estado = "SIN_COMPETENCIA"
 
