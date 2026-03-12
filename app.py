@@ -48,40 +48,6 @@ def detectar_paquete(texto: str) -> int:
     return 1
 
 
-def obtener_familia_modelo(texto: str) -> str:
-    t = normalizar(texto)
-
-    familias = [
-        "PREMIUMCONTACT",
-        "POWERCONTACT",
-        "ULTRACONTACT",
-        "ECOCONTACT",
-        "PROCONTACT",
-        "CONTIPROCONTACT",
-        "CONTIECOCONTACT",
-        "CROSSCONTACT",
-        "SPORTCONTACT",
-        "CONTISCOOT",
-        "EAGLE SPORT",
-        "KINERGY",
-        "VENTUS",
-        "OPTIMO",
-        "WRANGLER",
-        "ASSURANCE",
-        "EFFICIENTGRIP",
-        "DP-V1",
-        "GT H436",
-        "H735",
-        "K715"
-    ]
-
-    for familia in familias:
-        if familia in t:
-            return familia
-
-    return ""
-
-
 def analizar_llanta(texto: str) -> dict:
     t = normalizar(texto)
 
@@ -112,12 +78,10 @@ def analizar_llanta(texto: str) -> dict:
             medida = m.group(0)
             break
 
-    familia = obtener_familia_modelo(t)
-
     limpio = t
     for token in [
         "LLANTA", "LLANTAS", "NEUMATICO", "NEUMATICOS", "KIT", "PAQUETE", "P",
-        "AUTO", "AUTOMOVIL", "CARRO", "SUV", "CAMIONETA"
+        "AUTO", "AUTOMOVIL", "CARRO", "CARRo", "SUV", "CAMIONETA"
     ]:
         limpio = re.sub(rf"\b{token}\b", " ", limpio)
 
@@ -139,7 +103,6 @@ def analizar_llanta(texto: str) -> dict:
     return {
         "marca": marca,
         "medida": medida,
-        "familia": familia,
         "tokens": modelo_tokens,
         "modelo": " ".join(modelo_tokens).strip()
     }
@@ -161,6 +124,27 @@ def similitud_modelo(a: str, b: str) -> float:
     comunes = contar_coincidencias(ta, tb)
     base = max(len(ta), len(tb), 1)
     return comunes / base
+
+
+def penalizacion_modelo_conflictivo(objetivo_modelo: str, encontrado_modelo: str) -> int:
+    objetivo = normalizar(objetivo_modelo)
+    encontrado = normalizar(encontrado_modelo)
+
+    familias_conflictivas = [
+        "PREMIUMCONTACT", "POWERCONTACT", "ULTRACONTACT",
+        "ECOCONTACT", "PROCONTACT", "CONTIPROCONTACT",
+        "CONTIECOCONTACT", "CROSSCONTACT", "SPORTCONTACT",
+        "EAGLE SPORT", "KINERGY", "VENTUS", "OPTIMO",
+        "CONTISCOOT", "SCORPION", "WRANGLER"
+    ]
+
+    objetivo_hits = [f for f in familias_conflictivas if f in objetivo]
+    encontrado_hits = [f for f in familias_conflictivas if f in encontrado]
+
+    if objetivo_hits and encontrado_hits and objetivo_hits[0] != encontrado_hits[0]:
+        return -250
+
+    return 0
 
 
 def penalizacion_palabras_conflictivas(titulo: str) -> int:
@@ -259,6 +243,7 @@ def extraer_vendedor_listado(item):
 
     return ""
 
+
 def extraer_vendedor_detalle(url):
     if not url:
         return ""
@@ -314,34 +299,29 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
             score += 80
             razones.append("marca")
         else:
-            score -= 300
+            score -= 250
 
+    # medida casi obligatoria
     if descripcion_objetivo["medida"]:
         if encontrado["medida"]:
             if medida_compatible(descripcion_objetivo["medida"], encontrado["medida"]):
                 score += 220
                 razones.append("medida")
             else:
-                score -= 600
+                score -= 500
         else:
-            score -= 250
-
-    # familia obligatoria si existe en la búsqueda
-    if descripcion_objetivo["familia"]:
-        if encontrado["familia"]:
-            if descripcion_objetivo["familia"] == encontrado["familia"]:
-                score += 260
-                razones.append("familia")
-            else:
-                score -= 1000
-        else:
-            score -= 500
+            score -= 200
 
     sim_modelo = similitud_modelo(descripcion_objetivo["modelo"], encontrado["modelo"])
-    score += int(sim_modelo * 120)
+    score += int(sim_modelo * 140)
 
     coincidencias = contar_coincidencias(descripcion_objetivo["tokens"], encontrado["tokens"])
-    score += coincidencias * 10
+    score += coincidencias * 12
+
+    score += penalizacion_modelo_conflictivo(
+        descripcion_objetivo["modelo"],
+        encontrado["modelo"]
+    )
 
     score += penalizacion_palabras_conflictivas(titulo_encontrado)
 
@@ -430,18 +410,12 @@ def buscar():
 
             score, paquete, razones, encontrado = calcular_score(objetivo, titulo, precio_num)
 
+            # filtro mínimo: si la marca o medida chocan muy feo, no considerar
             if objetivo["marca"] and encontrado["marca"] and objetivo["marca"] != encontrado["marca"]:
                 continue
 
             if objetivo["medida"] and encontrado["medida"]:
                 if not medida_compatible(objetivo["medida"], encontrado["medida"]):
-                    continue
-
-            # filtro obligatorio de familia
-            if objetivo["familia"]:
-                if not encontrado["familia"]:
-                    continue
-                if objetivo["familia"] != encontrado["familia"]:
                     continue
 
             candidato = {
