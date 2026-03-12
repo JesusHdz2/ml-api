@@ -376,7 +376,7 @@ def buscar():
             "titulo_encontrado": ""
         }), 400
 
-    url_busqueda = f"{BASE_LISTADO}{quote(q)}"
+    url_busqueda = f"{BASE_LISTADO}{quote(q, safe='')}"
 
     try:
         r = requests.get(url_busqueda, headers=HEADERS, timeout=25)
