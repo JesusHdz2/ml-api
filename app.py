@@ -1,42 +1,29 @@
 from flask import Flask, request, jsonify
 import requests
 import re
-from bs4 import BeautifulSoup
 from urllib.parse import quote
 
 app = Flask(__name__)
 
-BASE_LISTADO = "https://listado.mercadolibre.com.mx/"
 MI_VENDEDOR = "COMERCIALIZADORADEPROMOCIONES"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
+ML_API_SEARCH = "https://api.mercadolibre.com/sites/MLM/search"
 
 
 def normalizar(texto: str) -> str:
     texto = str(texto or "").upper().strip()
-    texto = (
-        texto.replace("Á", "A")
-        .replace("É", "E")
-        .replace("Í", "I")
-        .replace("Ó", "O")
-        .replace("Ú", "U")
-    )
+    reemplazos = {
+        "Á": "A",
+        "É": "E",
+        "Í": "I",
+        "Ó": "O",
+        "Ú": "U",
+        "Ñ": "N"
+    }
+    for a, b in reemplazos.items():
+        texto = texto.replace(a, b)
+
     texto = re.sub(r"\s+", " ", texto)
     return texto
-
-
-def extraer_texto(node):
-    return normalizar(node.get_text(" ", strip=True)) if node else ""
 
 
 def detectar_paquete(texto: str) -> int:
@@ -46,6 +33,7 @@ def detectar_paquete(texto: str) -> int:
         return 4
     if re.search(r"\bKIT DE 2\b|\bPAQUETE DE 2\b|\b2 LLANTAS\b|\b2 NEUMATICOS\b", t):
         return 2
+
     return 1
 
 
@@ -53,9 +41,9 @@ def analizar_llanta(texto: str) -> dict:
     t = normalizar(texto)
 
     marcas = [
-        "CONTINENTAL", "GOODYEAR", "HANKOOK", "GITI", "ATLAS", "MICHELIN",
-        "PIRELLI", "BRIDGESTONE", "FIRESTONE", "YOKOHAMA", "DUNLOP",
-        "GENERAL TIRE", "BFGOODRICH", "TOYO", "KUMHO", "MAXXIS"
+        "CONTINENTAL", "GOODYEAR", "HANKOOK", "GITI", "ATLAS",
+        "MICHELIN", "PIRELLI", "BRIDGESTONE", "FIRESTONE",
+        "YOKOHAMA", "DUNLOP", "TOYO", "KUMHO", "MAXXIS"
     ]
 
     marca = ""
@@ -69,8 +57,8 @@ def analizar_llanta(texto: str) -> dict:
         r"\b\d{3}\/\d{2}ZR\d{2}\b",
         r"\b\d{3}\/\d{2}SR\d{2}\b",
         r"\b\d{3}\/\d{2}-\d{2}\b",
-        r"\b\d{2,3}X\d{2}\.?\d{1,2}-\d{2}\b",
-        r"\b195R15C\b"
+        r"\b195R15C\b",
+        r"\b\d{3}R\d{2}C\b"
     ]
 
     medida = ""
@@ -80,208 +68,66 @@ def analizar_llanta(texto: str) -> dict:
             medida = m.group(0)
             break
 
+    indice_pat = re.search(r"\b\d{2,3}\/?\d{0,3}[A-Z]{1,2}\b|\b\d{2,3}[A-Z]\b", t)
+    indice = indice_pat.group(0) if indice_pat else ""
+
     limpio = t
-    for token in [
-        "LLANTA", "LLANTAS", "NEUMATICO", "NEUMATICOS", "KIT", "PAQUETE", "P",
+
+    basura = [
+        "LLANTA", "LLANTAS", "NEUMATICO", "NEUMATICOS",
         "AUTO", "AUTOMOVIL", "CARRO", "SUV", "CAMIONETA"
-    ]:
+    ]
+
+    for token in basura:
         limpio = re.sub(rf"\b{token}\b", " ", limpio)
 
     tokens = [x for x in limpio.split() if len(x) > 1]
 
     modelo_tokens = tokens[:]
+
     if marca:
         modelo_tokens = [x for x in modelo_tokens if x != marca]
+
     if medida:
         modelo_tokens = [x for x in modelo_tokens if x != medida]
 
+    if indice:
+        modelo_tokens = [x for x in modelo_tokens if x != indice]
+
     modelo_tokens = [
         x for x in modelo_tokens
-        if not re.fullmatch(r"\d{2,3}", x)
+        if not re.fullmatch(r"\d{1,3}", x)
         and not re.fullmatch(r"[A-Z]{1,2}", x)
-        and not re.fullmatch(r"\d{2,3}[A-Z]", x)
     ]
 
     return {
         "marca": marca,
         "medida": medida,
-        "tokens": modelo_tokens,
-        "modelo": " ".join(modelo_tokens).strip()
+        "indice": indice,
+        "modelo": " ".join(modelo_tokens).strip(),
+        "tokens": modelo_tokens
     }
 
 
-def contar_coincidencias(a: list, b: list) -> int:
-    if not a or not b:
+def contar_coincidencias(lista_a: list, lista_b: list) -> int:
+    if not lista_a or not lista_b:
         return 0
-    set_b = set(b)
-    return sum(1 for x in a if x in set_b)
+
+    set_b = set(lista_b)
+    return sum(1 for x in lista_a if x in set_b)
 
 
 def similitud_modelo(a: str, b: str) -> float:
     ta = [x for x in normalizar(a).split() if x]
     tb = [x for x in normalizar(b).split() if x]
+
     if not ta or not tb:
         return 0.0
 
     comunes = contar_coincidencias(ta, tb)
     base = max(len(ta), len(tb), 1)
+
     return comunes / base
-
-
-def penalizacion_modelo_conflictivo(objetivo_modelo: str, encontrado_modelo: str) -> int:
-    objetivo = normalizar(objetivo_modelo)
-    encontrado = normalizar(encontrado_modelo)
-
-    familias_conflictivas = [
-        "PREMIUMCONTACT", "POWERCONTACT", "ULTRACONTACT",
-        "ECOCONTACT", "PROCONTACT", "CONTIPROCONTACT",
-        "CONTIECOCONTACT", "CROSSCONTACT", "SPORTCONTACT",
-        "EAGLE SPORT", "KINERGY", "VENTUS", "OPTIMO",
-        "CONTISCOOT", "SCORPION", "WRANGLER"
-    ]
-
-    objetivo_hits = [f for f in familias_conflictivas if f in objetivo]
-    encontrado_hits = [f for f in familias_conflictivas if f in encontrado]
-
-    if objetivo_hits and encontrado_hits and objetivo_hits[0] != encontrado_hits[0]:
-        return -250
-
-    return 0
-
-
-def penalizacion_palabras_conflictivas(titulo: str) -> int:
-    t = normalizar(titulo)
-
-    conflictivas = [
-        "SCOOTER", "MOTO", "MOTOCICLETA", "CUATRIMOTO", "ATV",
-        "BICICLETA", "TRAILER", "REMOLQUE", "CAMARA", "RIN",
-        "ARO", "REFACCION", "VALVULA"
-    ]
-
-    penalty = 0
-    for palabra in conflictivas:
-        if palabra in t:
-            penalty -= 220
-
-    return penalty
-
-
-def extraer_precio(item):
-    selectores = [
-        ".andes-money-amount__fraction",
-        ".price-tag-fraction",
-        "span.andes-money-amount__fraction",
-        "span.price-tag-fraction",
-    ]
-
-    for sel in selectores:
-        n = item.select_one(sel)
-        if n:
-            txt = extraer_texto(n)
-            txt = re.sub(r"[^\d]", "", txt)
-            if txt:
-                valor = int(txt)
-                return valor, f"${valor:,.0f}"
-
-    html = str(item)
-    patrones = [
-        r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-        r'"amount"\s*:\s*([0-9]+(?:\.[0-9]+)?)'
-    ]
-
-    for patron in patrones:
-        m = re.search(patron, html)
-        if m:
-            valor = int(float(m.group(1)))
-            return valor, f"${valor:,.0f}"
-
-    return 0, ""
-
-
-def extraer_link(item):
-    selectores = [
-        "a.poly-component__title",
-        "a.ui-search-link",
-        "a[href*='/MLM-']",
-        "a[href]"
-    ]
-
-    for sel in selectores:
-        a = item.select_one(sel)
-        if a and a.get("href"):
-            return a["href"]
-
-    return ""
-
-
-def extraer_titulo(item):
-    selectores = [
-        "a.poly-component__title",
-        "h2",
-        ".ui-search-item__title",
-    ]
-
-    for sel in selectores:
-        n = item.select_one(sel)
-        txt = extraer_texto(n)
-        if txt:
-            return txt
-
-    return ""
-
-
-def extraer_vendedor_listado(item):
-    patrones = [
-        ".poly-component__seller",
-        ".ui-search-item__group__element--seller",
-        "[class*='seller']",
-    ]
-
-    for sel in patrones:
-        n = item.select_one(sel)
-        txt = extraer_texto(n)
-        if txt:
-            return txt
-
-    return ""
-
-
-def extraer_vendedor_detalle(url):
-    if not url:
-        return ""
-
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            return ""
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        texto = soup.get_text(" ", strip=True)
-
-        candidatos = [
-            soup.select_one("[data-testid='seller-link']"),
-            soup.select_one("[data-testid='seller-name']"),
-            soup.select_one("a[href*='perfil']"),
-            soup.select_one("a[href*='seller']"),
-        ]
-
-        for c in candidatos:
-            txt = extraer_texto(c)
-            if txt:
-                return txt
-
-        m = re.search(r'"nickname"\s*:\s*"([^"]+)"', r.text)
-        if m:
-            return normalizar(m.group(1))
-
-        m2 = re.search(r"VENDIDO POR\s+([A-Z0-9 _\-.]+)", normalizar(texto))
-        if m2:
-            return normalizar(m2.group(1))
-
-        return ""
-
-    except Exception:
-        return ""
 
 
 def medida_compatible(medida_obj: str, medida_enc: str) -> bool:
@@ -294,31 +140,71 @@ def es_publicacion_propia(vendedor: str) -> bool:
     return MI_VENDEDOR in normalizar(vendedor)
 
 
+def penalizacion_modelo_conflictivo(objetivo_modelo: str, encontrado_modelo: str) -> int:
+    objetivo = normalizar(objetivo_modelo)
+    encontrado = normalizar(encontrado_modelo)
+
+    familias = [
+        "PREMIUMCONTACT",
+        "ULTRACONTACT",
+        "POWERCONTACT",
+        "PROCONTACT",
+        "CONTIPROCONTACT",
+        "ECOCONTACT",
+        "CONTIECOCONTACT",
+        "EAGLE SPORT",
+        "ASSURANCE",
+        "KINERGY",
+        "OPTIMO",
+        "VENTUS",
+        "COMFORT F50"
+    ]
+
+    objetivo_hit = [f for f in familias if f in objetivo]
+    encontrado_hit = [f for f in familias if f in encontrado]
+
+    if objetivo_hit and encontrado_hit and objetivo_hit[0] != encontrado_hit[0]:
+        return -250
+
+    return 0
+
+
 def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_num: int) -> tuple:
     encontrado = analizar_llanta(titulo_encontrado)
 
     score = 0
     razones = []
 
+    # Marca
     if descripcion_objetivo["marca"] and encontrado["marca"]:
         if descripcion_objetivo["marca"] == encontrado["marca"]:
             score += 80
             razones.append("marca")
         else:
-            score -= 250
+            score -= 300
 
+    # Medida
     if descripcion_objetivo["medida"]:
         if encontrado["medida"]:
             if medida_compatible(descripcion_objetivo["medida"], encontrado["medida"]):
-                score += 220
+                score += 240
                 razones.append("medida")
             else:
-                score -= 500
+                score -= 600
         else:
-            score -= 200
+            score -= 180
 
+    # Índice
+    if descripcion_objetivo["indice"] and encontrado["indice"]:
+        if descripcion_objetivo["indice"] == encontrado["indice"]:
+            score += 40
+            razones.append("indice")
+        else:
+            score -= 70
+
+    # Similitud de modelo
     sim_modelo = similitud_modelo(descripcion_objetivo["modelo"], encontrado["modelo"])
-    score += int(sim_modelo * 140)
+    score += int(sim_modelo * 160)
 
     coincidencias = contar_coincidencias(descripcion_objetivo["tokens"], encontrado["tokens"])
     score += coincidencias * 12
@@ -328,20 +214,18 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
         encontrado["modelo"]
     )
 
-    score += penalizacion_palabras_conflictivas(titulo_encontrado)
+    # Penaliza palabras conflictivas
+    conflictivas = [
+        "MOTO", "MOTOCICLETA", "SCOOTER", "ATV", "CUATRIMOTO",
+        "RIN", "ARO", "VALVULA", "CAMARA", "REFACCION"
+    ]
+    titulo_norm = normalizar(titulo_encontrado)
+    for palabra in conflictivas:
+        if palabra in titulo_norm:
+            score -= 220
 
-    nums_obj = re.findall(r"\b\d+\b", descripcion_objetivo["modelo"])
-    nums_enc = re.findall(r"\b\d+\b", encontrado["modelo"])
-    if nums_obj:
-        if any(n in nums_enc for n in nums_obj):
-            score += 40
-        else:
-            score -= 80
-
+    # Penaliza kits
     paquete = detectar_paquete(titulo_encontrado)
-
-    # AQUÍ ESTÁ LA MEJORA:
-    # penaliza kits para favorecer llanta individual
     if paquete == 4:
         score -= 500
     elif paquete == 2:
@@ -349,6 +233,7 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
     else:
         score += 60
 
+    # Pequeño premio al menor precio
     if precio_num > 0:
         score += int(25000 / max(precio_num, 1))
 
@@ -357,7 +242,10 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "ml-html-parser"})
+    return jsonify({
+        "ok": True,
+        "service": "ml-api"
+    })
 
 
 @app.get("/buscar")
@@ -366,7 +254,7 @@ def buscar():
 
     if not q:
         return jsonify({
-            "estado": "QUERY VACIA",
+            "estado": "QUERY_VACIA",
             "precio_ml": "",
             "proveedor": "",
             "url": "",
@@ -376,37 +264,36 @@ def buscar():
             "titulo_encontrado": ""
         }), 400
 
-    url_busqueda = f"{BASE_LISTADO}{quote(q, safe='')}"
+    url_api = f"{ML_API_SEARCH}?q={quote(q, safe='')}"
 
     try:
-        r = requests.get(url_busqueda, headers=HEADERS, timeout=25)
+        r = requests.get(
+            url_api,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=25
+        )
 
         if r.status_code != 200:
             return jsonify({
-                "estado": f"HTTP {r.status_code}",
+                "estado": f"HTTP_{r.status_code}",
                 "precio_ml": "",
                 "proveedor": "",
-                "url": url_busqueda,
+                "url": url_api,
                 "precio_propio": "",
                 "proveedor_propio": "",
                 "url_propia": "",
                 "titulo_encontrado": ""
             })
 
-        soup = BeautifulSoup(r.text, "html.parser")
+        data = r.json()
+        resultados = data.get("results", [])
 
-        items = (
-            soup.select("li.ui-search-layout__item") or
-            soup.select(".ui-search-result__wrapper") or
-            soup.select("ol li")
-        )
-
-        if not items:
+        if not resultados:
             return jsonify({
-                "estado": "NO RESULTADOS HTML",
+                "estado": "SIN_RESULTADOS_API",
                 "precio_ml": "",
                 "proveedor": "",
-                "url": url_busqueda,
+                "url": url_api,
                 "precio_propio": "",
                 "proveedor_propio": "",
                 "url_propia": "",
@@ -421,17 +308,23 @@ def buscar():
         mejor_propio = None
         mejor_propio_score = -999999
 
-        for item in items[:15]:
-            titulo = extraer_titulo(item)
+        for item in resultados[:30]:
+            titulo = normalizar(item.get("title", ""))
             if not titulo:
                 continue
 
-            precio_num, precio_txt = extraer_precio(item)
-            link = extraer_link(item)
-            proveedor = extraer_vendedor_listado(item)
+            precio_num = int(item.get("price", 0) or 0)
+            precio_txt = f"${precio_num:,.0f}" if precio_num else ""
+            link = item.get("permalink", "")
+            proveedor = normalizar(item.get("seller", {}).get("nickname", ""))
+            estado_item = normalizar(item.get("status", ""))
+            stock = int(item.get("available_quantity", 0) or 0)
 
-            if not proveedor and link:
-                proveedor = extraer_vendedor_detalle(link)
+            if estado_item and estado_item != "ACTIVE":
+                continue
+
+            if stock <= 0:
+                continue
 
             score, paquete, razones, encontrado = calcular_score(objetivo, titulo, precio_num)
 
@@ -442,7 +335,6 @@ def buscar():
                 if not medida_compatible(objetivo["medida"], encontrado["medida"]):
                     continue
 
-            # descarta paquetes
             if paquete != 1:
                 continue
 
@@ -489,7 +381,7 @@ def buscar():
             "estado": estado,
             "precio_ml": mejor_comp["precio_txt"] if mejor_comp else "",
             "proveedor": mejor_comp["proveedor"] if mejor_comp else "",
-            "url": mejor_comp["link"] if mejor_comp else url_busqueda,
+            "url": mejor_comp["link"] if mejor_comp else url_api,
             "titulo_encontrado": mejor_comp["titulo"] if mejor_comp else "",
             "precio_propio": mejor_propio["precio_txt"] if mejor_propio else "",
             "proveedor_propio": mejor_propio["proveedor"] if mejor_propio else "",
@@ -501,12 +393,12 @@ def buscar():
             "estado": f"ERROR: {str(e)[:120]}",
             "precio_ml": "",
             "proveedor": "",
-            "url": url_busqueda,
+            "url": url_api,
             "titulo_encontrado": "",
             "precio_propio": "",
             "proveedor_propio": "",
             "url_propia": ""
-        })
+        }), 500
 
 
 if __name__ == "__main__":
