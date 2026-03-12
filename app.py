@@ -7,6 +7,7 @@ from urllib.parse import quote
 app = Flask(__name__)
 
 BASE_LISTADO = "https://listado.mercadolibre.com.mx/"
+MI_VENDEDOR = "COMERCIALIZADORADEPROMOCIONES"
 
 HEADERS = {
     "User-Agent": (
@@ -68,7 +69,8 @@ def analizar_llanta(texto: str) -> dict:
         r"\b\d{3}\/\d{2}ZR\d{2}\b",
         r"\b\d{3}\/\d{2}SR\d{2}\b",
         r"\b\d{3}\/\d{2}-\d{2}\b",
-        r"\b\d{2,3}X\d{2}\.?\d{1,2}-\d{2}\b"
+        r"\b\d{2,3}X\d{2}\.?\d{1,2}-\d{2}\b",
+        r"\b195R15C\b"
     ]
 
     medida = ""
@@ -81,7 +83,7 @@ def analizar_llanta(texto: str) -> dict:
     limpio = t
     for token in [
         "LLANTA", "LLANTAS", "NEUMATICO", "NEUMATICOS", "KIT", "PAQUETE", "P",
-        "AUTO", "AUTOMOVIL", "CARRO", "CARRo", "SUV", "CAMIONETA"
+        "AUTO", "AUTOMOVIL", "CARRO", "SUV", "CAMIONETA"
     ]:
         limpio = re.sub(rf"\b{token}\b", " ", limpio)
 
@@ -288,6 +290,10 @@ def medida_compatible(medida_obj: str, medida_enc: str) -> bool:
     return normalizar(medida_obj) == normalizar(medida_enc)
 
 
+def es_publicacion_propia(vendedor: str) -> bool:
+    return MI_VENDEDOR in normalizar(vendedor)
+
+
 def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_num: int) -> tuple:
     encontrado = analizar_llanta(titulo_encontrado)
 
@@ -301,7 +307,6 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
         else:
             score -= 250
 
-    # medida casi obligatoria
     if descripcion_objetivo["medida"]:
         if encontrado["medida"]:
             if medida_compatible(descripcion_objetivo["medida"], encontrado["medida"]):
@@ -334,13 +339,18 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
             score -= 80
 
     paquete = detectar_paquete(titulo_encontrado)
+
+    # AQUÍ ESTÁ LA MEJORA:
+    # penaliza kits para favorecer llanta individual
     if paquete == 4:
-        score += 15
+        score -= 500
     elif paquete == 2:
-        score += 10
+        score -= 250
+    else:
+        score += 60
 
     if precio_num > 0:
-        score += int(40000 / max(precio_num / paquete, 1))
+        score += int(25000 / max(precio_num, 1))
 
     return score, paquete, razones, encontrado
 
@@ -357,9 +367,12 @@ def buscar():
     if not q:
         return jsonify({
             "estado": "QUERY VACIA",
-            "precio": "",
+            "precio_ml": "",
             "proveedor": "",
             "url": "",
+            "precio_propio": "",
+            "proveedor_propio": "",
+            "url_propia": "",
             "titulo_encontrado": ""
         }), 400
 
@@ -371,9 +384,12 @@ def buscar():
         if r.status_code != 200:
             return jsonify({
                 "estado": f"HTTP {r.status_code}",
-                "precio": "",
+                "precio_ml": "",
                 "proveedor": "",
                 "url": url_busqueda,
+                "precio_propio": "",
+                "proveedor_propio": "",
+                "url_propia": "",
                 "titulo_encontrado": ""
             })
 
@@ -388,18 +404,24 @@ def buscar():
         if not items:
             return jsonify({
                 "estado": "NO RESULTADOS HTML",
-                "precio": "",
+                "precio_ml": "",
                 "proveedor": "",
                 "url": url_busqueda,
+                "precio_propio": "",
+                "proveedor_propio": "",
+                "url_propia": "",
                 "titulo_encontrado": ""
             })
 
         objetivo = analizar_llanta(q)
 
-        mejor = None
-        mejor_score = -999999
+        mejor_comp = None
+        mejor_comp_score = -999999
 
-        for item in items[:12]:
+        mejor_propio = None
+        mejor_propio_score = -999999
+
+        for item in items[:15]:
             titulo = extraer_titulo(item)
             if not titulo:
                 continue
@@ -408,15 +430,21 @@ def buscar():
             link = extraer_link(item)
             proveedor = extraer_vendedor_listado(item)
 
+            if not proveedor and link:
+                proveedor = extraer_vendedor_detalle(link)
+
             score, paquete, razones, encontrado = calcular_score(objetivo, titulo, precio_num)
 
-            # filtro mínimo: si la marca o medida chocan muy feo, no considerar
             if objetivo["marca"] and encontrado["marca"] and objetivo["marca"] != encontrado["marca"]:
                 continue
 
             if objetivo["medida"] and encontrado["medida"]:
                 if not medida_compatible(objetivo["medida"], encontrado["medida"]):
                     continue
+
+            # descarta paquetes
+            if paquete != 1:
+                continue
 
             candidato = {
                 "score": score,
@@ -429,46 +457,55 @@ def buscar():
                 "razones": razones
             }
 
-            if candidato["score"] > mejor_score:
-                mejor_score = candidato["score"]
-                mejor = candidato
+            if es_publicacion_propia(proveedor):
+                if candidato["score"] > mejor_propio_score:
+                    mejor_propio_score = candidato["score"]
+                    mejor_propio = candidato
+            else:
+                if candidato["score"] > mejor_comp_score:
+                    mejor_comp_score = candidato["score"]
+                    mejor_comp = candidato
 
-        if not mejor:
-            return jsonify({
-                "estado": "SIN MATCH",
-                "precio": "",
-                "proveedor": "",
-                "url": url_busqueda,
-                "titulo_encontrado": ""
-            })
+        estado = "SIN_RESULTADOS"
 
-        proveedor_final = mejor["proveedor"]
-        if not proveedor_final:
-            proveedor_final = extraer_vendedor_detalle(mejor["link"])
+        if mejor_comp and mejor_propio:
+            if mejor_propio["precio_num"] and mejor_comp["precio_num"]:
+                if mejor_propio["precio_num"] < mejor_comp["precio_num"]:
+                    estado = "MAS_BARATO"
+                elif mejor_propio["precio_num"] > mejor_comp["precio_num"]:
+                    estado = "MAS_CARO"
+                else:
+                    estado = "IGUALADO"
+            else:
+                estado = "OK"
 
-        estado = "OK"
-        if not mejor["precio_txt"]:
-            estado = "SIN PRECIO"
-        elif not proveedor_final:
-            estado = "OK SIN PROVEEDOR"
+        elif mejor_comp and not mejor_propio:
+            estado = "SIN_PUBLICACION_PROPIA"
+
+        elif mejor_propio and not mejor_comp:
+            estado = "SIN_COMPETENCIA"
 
         return jsonify({
             "estado": estado,
-            "precio": mejor["precio_txt"],
-            "proveedor": proveedor_final,
-            "url": mejor["link"] or url_busqueda,
-            "titulo_encontrado": mejor["titulo"],
-            "score": mejor["score"],
-            "paquete": mejor["paquete"]
+            "precio_ml": mejor_comp["precio_txt"] if mejor_comp else "",
+            "proveedor": mejor_comp["proveedor"] if mejor_comp else "",
+            "url": mejor_comp["link"] if mejor_comp else url_busqueda,
+            "titulo_encontrado": mejor_comp["titulo"] if mejor_comp else "",
+            "precio_propio": mejor_propio["precio_txt"] if mejor_propio else "",
+            "proveedor_propio": mejor_propio["proveedor"] if mejor_propio else "",
+            "url_propia": mejor_propio["link"] if mejor_propio else ""
         })
 
     except Exception as e:
         return jsonify({
             "estado": f"ERROR: {str(e)[:120]}",
-            "precio": "",
+            "precio_ml": "",
             "proveedor": "",
             "url": url_busqueda,
-            "titulo_encontrado": ""
+            "titulo_encontrado": "",
+            "precio_propio": "",
+            "proveedor_propio": "",
+            "url_propia": ""
         })
 
 
