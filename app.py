@@ -1,16 +1,30 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import requests
 import re
 import os
-from urllib.parse import quote
+from urllib.parse import urlencode, quote
 
 app = Flask(__name__)
 
+# =========================
+# VARIABLES DE ENTORNO
+# =========================
+ML_CLIENT_ID = os.getenv("ML_CLIENT_ID", "")
+ML_CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET", "")
+ML_REDIRECT_URI = os.getenv("ML_REDIRECT_URI", "")
+
+ML_ACCESS_TOKEN = os.getenv("ML_ACCESS_TOKEN", "")
+ML_REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN", "")
+
 MI_VENDEDOR = "COMERCIALIZADORADEPROMOCIONES"
 ML_API_SEARCH = "https://api.mercadolibre.com/sites/MLM/search"
-ML_ACCESS_TOKEN = os.getenv("ML_ACCESS_TOKEN", "")
+ML_AUTH_URL = "https://auth.mercadolibre.com.mx/authorization"
+ML_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
 
 
+# =========================
+# FUNCIONES AUXILIARES
+# =========================
 def normalizar(texto: str) -> str:
     texto = str(texto or "").upper().strip()
     reemplazos = {
@@ -236,14 +250,184 @@ def calcular_score(descripcion_objetivo: dict, titulo_encontrado: str, precio_nu
     return score, paquete, razones, encontrado
 
 
+def obtener_headers_ml():
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
+    }
+
+    token = os.getenv("ML_ACCESS_TOKEN", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    return headers
+
+
+# =========================
+# RUTAS DE SALUD
+# =========================
 @app.get("/")
 def health():
     return jsonify({
         "ok": True,
-        "service": "ml-api"
+        "service": "ml-api",
+        "login_ml": "/login_ml",
+        "token_status": "/token_status"
     })
 
 
+@app.get("/token_status")
+def token_status():
+    return jsonify({
+        "client_id_configurado": bool(ML_CLIENT_ID),
+        "client_secret_configurado": bool(ML_CLIENT_SECRET),
+        "redirect_uri_configurado": bool(ML_REDIRECT_URI),
+        "access_token_configurado": bool(os.getenv("ML_ACCESS_TOKEN", "")),
+        "refresh_token_configurado": bool(os.getenv("ML_REFRESH_TOKEN", ""))
+    })
+
+
+# =========================
+# LOGIN OAUTH MERCADO LIBRE
+# =========================
+@app.get("/login_ml")
+def login_ml():
+    if not ML_CLIENT_ID or not ML_REDIRECT_URI:
+        return jsonify({
+            "ok": False,
+            "mensaje": "Faltan ML_CLIENT_ID o ML_REDIRECT_URI"
+        }), 500
+
+    params = {
+        "response_type": "code",
+        "client_id": ML_CLIENT_ID,
+        "redirect_uri": ML_REDIRECT_URI,
+        "state": "comparador_ml_001"
+    }
+
+    url = f"{ML_AUTH_URL}?{urlencode(params)}"
+    return redirect(url)
+
+
+@app.get("/callback")
+def callback():
+    code = request.args.get("code")
+    error = request.args.get("error")
+    state = request.args.get("state")
+
+    if error:
+        return jsonify({
+            "ok": False,
+            "mensaje": "Mercado Libre devolvió error",
+            "error": error,
+            "state": state
+        }), 400
+
+    if not code:
+        return jsonify({
+            "ok": False,
+            "mensaje": "No llegó code"
+        }), 400
+
+    payload = {
+        "grant_type": "authorization_code",
+        "client_id": ML_CLIENT_ID,
+        "client_secret": ML_CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": ML_REDIRECT_URI
+    }
+
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded"
+    }
+
+    r = requests.post(ML_TOKEN_URL, data=payload, headers=headers, timeout=30)
+
+    try:
+        data = r.json()
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "mensaje": "La respuesta no fue JSON",
+            "status_code": r.status_code,
+            "texto": r.text[:500]
+        }), 500
+
+    if r.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "mensaje": "No se pudo obtener token",
+            "status_code": r.status_code,
+            "respuesta_ml": data
+        }), 400
+
+    return jsonify({
+        "ok": True,
+        "mensaje": "Copia estos valores y guárdalos en Render",
+        "access_token": data.get("access_token", ""),
+        "refresh_token": data.get("refresh_token", ""),
+        "expires_in": data.get("expires_in", 0),
+        "scope": data.get("scope", ""),
+        "user_id": data.get("user_id", "")
+    })
+
+
+@app.get("/refresh_ml")
+def refresh_ml():
+    refresh_token = os.getenv("ML_REFRESH_TOKEN", "")
+
+    if not refresh_token:
+        return jsonify({
+            "ok": False,
+            "mensaje": "No existe ML_REFRESH_TOKEN en Render"
+        }), 400
+
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": ML_CLIENT_ID,
+        "client_secret": ML_CLIENT_SECRET,
+        "refresh_token": refresh_token
+    }
+
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded"
+    }
+
+    r = requests.post(ML_TOKEN_URL, data=payload, headers=headers, timeout=30)
+
+    try:
+        data = r.json()
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "mensaje": "La respuesta no fue JSON",
+            "status_code": r.status_code,
+            "texto": r.text[:500]
+        }), 500
+
+    if r.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "mensaje": "No se pudo refrescar token",
+            "status_code": r.status_code,
+            "respuesta_ml": data
+        }), 400
+
+    return jsonify({
+        "ok": True,
+        "mensaje": "Actualiza estos valores en Render",
+        "access_token": data.get("access_token", ""),
+        "refresh_token": data.get("refresh_token", ""),
+        "expires_in": data.get("expires_in", 0),
+        "scope": data.get("scope", "")
+    })
+
+
+# =========================
+# BUSQUEDA DE PRODUCTOS
+# =========================
 @app.get("/buscar")
 def buscar():
     q = normalizar(request.args.get("q", ""))
@@ -263,15 +447,11 @@ def buscar():
     url_api = f"{ML_API_SEARCH}?q={quote(q, safe='')}"
 
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json"
-        }
-
-        if ML_ACCESS_TOKEN:
-            headers["Authorization"] = f"Bearer {ML_ACCESS_TOKEN}"
-
-        r = requests.get(url_api, headers=headers, timeout=25)
+        r = requests.get(
+            url_api,
+            headers=obtener_headers_ml(),
+            timeout=25
+        )
 
         if r.status_code != 200:
             return jsonify({
@@ -304,6 +484,7 @@ def buscar():
 
         mejor_comp = None
         mejor_comp_score = -999999
+
         mejor_propio = None
         mejor_propio_score = -999999
 
@@ -315,8 +496,10 @@ def buscar():
             precio_num = int(item.get("price", 0) or 0)
             precio_txt = f"${precio_num:,.0f}" if precio_num else ""
             link = item.get("permalink", "")
+
             seller = item.get("seller") or {}
             proveedor = normalizar(seller.get("nickname", ""))
+
             estado_item = normalizar(item.get("status", ""))
             stock = int(item.get("available_quantity", 0) or 0)
 
@@ -344,9 +527,7 @@ def buscar():
                 "precio_num": precio_num,
                 "precio_txt": precio_txt,
                 "link": link,
-                "proveedor": proveedor,
-                "paquete": paquete,
-                "razones": razones
+                "proveedor": proveedor
             }
 
             if es_publicacion_propia(proveedor):
